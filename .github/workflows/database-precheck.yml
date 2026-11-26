@@ -1,0 +1,86 @@
+# Pull request gate for the DBmaestro project "Github-Integration".
+#
+#   Pull request that touches packages/<name>/  ->  detect  ->  create the package in DBmaestro + precheck
+#                                                ->  DBmaestro's verdict as a PR comment, annotations, job summary
+#
+# Releasing (Release_Source -> QA -> Prod) happens after the merge, in database-release.yml.
+# Settings, variables and the library this uses: see the header of database-release.yml.
+
+name: Database Precheck
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['packages/**']
+
+concurrency:
+  group: database-precheck-${{ github.event.pull_request.number }}
+  cancel-in-progress: true          # a new push to the PR replaces the running check
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  DBMAESTRO_PROJECT_NAME: Github-Integration
+  DBMAESTRO_PROJECT_ID: '9'
+  DBMAESTRO_SERVER: ${{ vars.DBMAESTRO_SERVER }}
+  DBMAESTRO_USE_SSL: ${{ vars.DBMAESTRO_USE_SSL }}
+  DBMAESTRO_USER: ${{ vars.DBMAESTRO_USER }}
+  DBMAESTRO_PASSWORD: ${{ secrets.DBMAESTRO_PASSWORD }}
+  DBMAESTRO_UI_URL: ${{ vars.DBMAESTRO_UI_URL }}
+  DBMAESTRO_AGENT_JAR: /home/runner/DBmaestroAgent.jar   # downloaded from DBMaestroDev/DBmaestroCLI by get-cli-jar
+  DBMAESTRO_PACKAGES_FOLDER: packages
+
+jobs:
+  detect:
+    name: Detect changed packages
+    # Public repo + self-hosted runner: pull requests from forks never run here.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, dbmaestro-k8s]
+    outputs:
+      has_packages: ${{ steps.detect.outputs.has_packages }}
+      packages_list: ${{ steps.detect.outputs.packages_list }}
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+      - name: Detect changed packages
+        id: detect
+        uses: DBMaestroDev/dbmaestro-cicd/.github/actions/sh/detect-changed-packages@v1
+        with:
+          is_pull_request: true
+          base_ref: ${{ github.base_ref }}
+      - name: Summary
+        run: |
+          echo "### 📦 Database packages in this pull request" >> "$GITHUB_STEP_SUMMARY"
+          echo "**${{ steps.detect.outputs.packages_list || 'none' }}**" >> "$GITHUB_STEP_SUMMARY"
+
+  precheck:
+    name: DBmaestro package & precheck
+    if: needs.detect.outputs.has_packages == 'true'
+    needs: detect
+    runs-on: [self-hosted, dbmaestro-k8s]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with: { repository: DBMaestroDev/dbmaestro-cicd, ref: v1, path: dbmaestro-cicd }
+      - name: Get DBmaestro CLI ${{ vars.CLI_VERSION }}
+        uses: DBMaestroDev/dbmaestro-cicd/.github/actions/sh/get-cli-jar@v1
+        with: { version: '${{ vars.CLI_VERSION }}', jar-path: '${{ env.DBMAESTRO_AGENT_JAR }}' }
+
+      - name: Package and precheck in DBmaestro
+        env:
+          PACKAGES: ${{ needs.detect.outputs.packages_list }}
+        run: |
+          rc=0
+          for PKG in ${PACKAGES//,/ }; do
+            DBMAESTRO_PACKAGE_NAME="$PKG" .github/scripts/dbmaestro.sh create-package "$PKG" || { rc=1; break; }
+            DBMAESTRO_PACKAGE_NAME="$PKG" .github/scripts/dbmaestro.sh precheck-package "$PKG" || rc=1
+          done
+          exit $rc
+
+      - name: Comment on the pull request
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/pr-comment.sh "${{ github.event.pull_request.number }}"

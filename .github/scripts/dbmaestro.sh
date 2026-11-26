@@ -59,6 +59,7 @@ fi
 details=""
 for b in "${BLOCKS[@]}";   do details+="⛔ \`$b\`<br>"; done
 for w in "${WARNINGS[@]}"; do details+="⚠️ \`$w\`<br>"; done
+[ -n "$SCRIPT_TXT" ] && [ -n "$details" ] && details+="in \`$SCRIPT_TXT\`<br>"
 [ -n "$DRIFT" ] && [ "$rc" -ne 0 ] && details+="🔍 \`$(echo "$DRIFT" | head -1 | tr '|' '/')\`<br>"
 
 link="${DBMAESTRO_UI_URL:-}/project/${DBMAESTRO_PROJECT_ID:-}/pipeline"
