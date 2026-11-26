@@ -54,6 +54,8 @@ jobs:
   # ------------------------------------------------------------------ which packages changed
   detect:
     name: Detect changed packages
+    # Public repo + self-hosted runner: pull requests from forks never run here (every other job needs this one).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, dbmaestro-k8s]
     outputs:
       has_packages: ${{ steps.detect.outputs.has_packages }}
@@ -125,6 +127,15 @@ jobs:
       - name: Get DBmaestro CLI ${{ vars.CLI_VERSION }}
         uses: DBMaestroDev/dbmaestro-cicd/.github/actions/sh/get-cli-jar@v1
         with: { version: '${{ vars.CLI_VERSION }}', jar-path: '${{ env.DBMAESTRO_AGENT_JAR }}' }
+      # A manual run releases packages that never went through a pull request, so nothing created them yet.
+      - name: Create packages in DBmaestro (manual run)
+        if: github.event_name == 'workflow_dispatch' && env.TARGET_ENV == 'Release_Source'
+        env:
+          PACKAGES: ${{ needs.detect.outputs.packages_list }}
+        run: |
+          for PKG in ${PACKAGES//,/ }; do
+            DBMAESTRO_PACKAGE_NAME="$PKG" .github/scripts/dbmaestro.sh create-package "$PKG" || exit 1
+          done
       - name: Upgrade ${{ env.TARGET_ENV }} with DBmaestro
         env:
           PACKAGES: ${{ needs.detect.outputs.packages_list }}
