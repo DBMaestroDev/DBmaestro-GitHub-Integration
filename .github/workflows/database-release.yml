@@ -1,11 +1,14 @@
 # Database release pipeline for the DBmaestro project "Github-Integration".
 #
-#   Pull request that touches packages/<name>/   -> detect -> DBmaestro package + precheck -> PR comment
-#   Merge into main                              -> Release_Source -> QA -> Prod (GitHub Environment approval)
+#   Merge into main (touches packages/<name>/)  ->  Release_Source  ->  QA  ->  Prod (GitHub Environment approval)
+#   Run workflow (manual, packages input)       ->  same, creating the packages in DBmaestro first
+#
+# Pull requests are checked by database-precheck.yml (package + precheck + PR comment).
 #
 # The DBmaestro steps come from the DBmaestro CI/CD library (github.com/DBMaestroDev/dbmaestro-cicd@v1):
-# change detection uses its composite action, packaging / precheck / upgrade run its core scripts through
-# .github/scripts/dbmaestro.sh, which also turns DBmaestro's verdicts into GitHub annotations and job summaries.
+# change detection and CLI download use its composite actions; packaging / precheck / upgrade run its core
+# scripts through .github/scripts/dbmaestro.sh, which also turns DBmaestro's verdicts into GitHub
+# annotations and job summaries.
 #
 # Settings -> Secrets and variables -> Actions
 #   vars.DBMAESTRO_SERVER     agent.dop.svc.cluster.local:80   (runner runs in the same cluster as DOP)
@@ -14,30 +17,26 @@
 #   vars.DBMAESTRO_UI_URL     http://localhost:8081            (links in summaries and PR comments)
 #   vars.CLI_VERSION          26.4.0.14192                     (DBmaestroCLI release, match the DOP server)
 #   secrets.DBMAESTRO_PASSWORD
+# Settings -> Environments: Release_Source, QA, Prod (Prod: required reviewers)
 
 name: Database Release
 
 on:
-  pull_request:
-    branches: [main]
-    paths: ['packages/**']
   push:
     branches: [main]
     paths: ['packages/**']
   workflow_dispatch:
     inputs:
       packages:
-        description: 'Packages to release (comma-separated, e.g. V3,V4). Empty = changed in the last commit.'
-        required: false
-        default: ''
+        description: 'Packages to release (comma-separated, e.g. V3,V4)'
+        required: true
 
 concurrency:
-  group: database-release-${{ github.ref }}
+  group: database-release          # one release at a time
   cancel-in-progress: false
 
 permissions:
   contents: read
-  pull-requests: write
 
 env:
   DBMAESTRO_PROJECT_NAME: Github-Integration
@@ -51,11 +50,8 @@ env:
   DBMAESTRO_PACKAGES_FOLDER: packages
 
 jobs:
-  # ------------------------------------------------------------------ which packages changed
   detect:
     name: Detect changed packages
-    # Public repo + self-hosted runner: pull requests from forks never run here (every other job needs this one).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, dbmaestro-k8s]
     outputs:
       has_packages: ${{ steps.detect.outputs.has_packages }}
@@ -63,63 +59,27 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
-
       - name: Detect changed packages
         id: detect
         uses: DBMaestroDev/dbmaestro-cicd/.github/actions/sh/detect-changed-packages@v1
         with:
-          is_pull_request: ${{ github.event_name == 'pull_request' }}
-          base_ref: ${{ github.base_ref }}
           detect_from_push: ${{ github.event_name == 'push' }}
           package_name: ${{ github.event.inputs.packages }}
-
       - name: Summary
         run: |
-          echo "### 📦 Database packages in this change" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 📦 Database packages in this release" >> "$GITHUB_STEP_SUMMARY"
           echo "**${{ steps.detect.outputs.packages_list || 'none' }}**" >> "$GITHUB_STEP_SUMMARY"
 
-  # ------------------------------------------------------------------ pull request
-  precheck:
-    name: DBmaestro package & precheck
-    if: github.event_name == 'pull_request' && needs.detect.outputs.has_packages == 'true'
-    needs: detect
-    runs-on: [self-hosted, dbmaestro-k8s]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/checkout@v6
-        with: { repository: DBMaestroDev/dbmaestro-cicd, ref: v1, path: dbmaestro-cicd }
-      - name: Get DBmaestro CLI ${{ vars.CLI_VERSION }}
-        uses: DBMaestroDev/dbmaestro-cicd/.github/actions/sh/get-cli-jar@v1
-        with: { version: '${{ vars.CLI_VERSION }}', jar-path: '${{ env.DBMAESTRO_AGENT_JAR }}' }
-
-      - name: Package and precheck in DBmaestro
-        id: precheck
-        env:
-          PACKAGES: ${{ needs.detect.outputs.packages_list }}
-        run: |
-          rc=0
-          for PKG in ${PACKAGES//,/ }; do
-            DBMAESTRO_PACKAGE_NAME="$PKG" .github/scripts/dbmaestro.sh create-package "$PKG" || { rc=1; break; }
-            DBMAESTRO_PACKAGE_NAME="$PKG" .github/scripts/dbmaestro.sh precheck-package "$PKG" || rc=1
-          done
-          exit $rc
-
-      - name: Comment on the pull request
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
-        run: .github/scripts/pr-comment.sh "$PR"
-
-  # ------------------------------------------------------------------ merge into main
   release-source:
     name: Release Source
-    if: github.event_name != 'pull_request' && needs.detect.outputs.has_packages == 'true'
+    if: needs.detect.outputs.has_packages == 'true'
     needs: detect
     runs-on: [self-hosted, dbmaestro-k8s]
     environment:
       name: Release_Source
       url: ${{ vars.DBMAESTRO_UI_URL }}/project/9/pipeline
+    env:
+      TARGET_ENV: Release_Source
     steps: &upgrade
       - uses: actions/checkout@v6
       - uses: actions/checkout@v6
@@ -144,8 +104,6 @@ jobs:
           for PKG in ${PACKAGES//,/ }; do
             DBMAESTRO_PACKAGE_NAME="$PKG" .github/scripts/dbmaestro.sh upgrade-environment "$PKG" || exit 1
           done
-    env:
-      TARGET_ENV: Release_Source
 
   qa:
     name: QA
