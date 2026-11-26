@@ -1,0 +1,69 @@
+# Self-hosted GitHub Actions runner inside the Docker Desktop cluster, next to DOP, so jobs reach the
+# DBmaestro agent at agent.dop.svc.cluster.local:80 (no port-forward, no public endpoint).
+#
+# Image: the official ghcr.io/actions/actions-runner. Docker Desktop's kind node cannot see images built
+# on the host, so instead of a custom image the start script installs Java + jq, then registers the
+# runner with a token fetched through GITHUB_TOKEN (--replace: a restarted pod re-registers the same
+# name). The DBmaestro CLI jar is downloaded by the workflow from DBMaestroDev/DBmaestroCLI
+# (dbmaestro-cicd get-cli-jar action).
+#
+#   kubectl create namespace github-runner
+#   kubectl -n github-runner create secret generic github-token --from-literal=token="$(gh auth token)"
+#   kubectl apply -f runner/runner.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: github-runner-start
+  namespace: github-runner
+data:
+  start.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    echo "Installing Java 21 + jq..."
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openjdk-21-jre-headless jq git curl >/dev/null
+    java -version 2>&1 | head -1
+
+    api="https://api.github.com/repos/${GITHUB_REPO}/actions/runners"
+    token() { curl -fsS -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "$api/$1" | jq -r .token; }
+
+    cd /home/runner
+    ./config.sh --unattended --replace \
+      --url "https://github.com/${GITHUB_REPO}" --token "$(token registration-token)" \
+      --name "${RUNNER_NAME}" --labels "${RUNNER_LABELS}" --work _work
+
+    cleanup() { ./config.sh remove --token "$(token remove-token)" || true; }
+    trap cleanup EXIT TERM INT
+    ./run.sh & wait $!
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-runner
+  namespace: github-runner
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: github-runner } }
+  template:
+    metadata: { labels: { app: github-runner } }
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: runner
+          image: ghcr.io/actions/actions-runner:2.332.0
+          command: ["/bin/bash", "/opt/start/start.sh"]
+          env:
+            - { name: GITHUB_REPO,   value: DBMaestroDev/DBmaestro-GitHub-Integration }
+            - { name: RUNNER_NAME,   value: dop-k8s-runner }
+            - { name: RUNNER_LABELS, value: "self-hosted,linux,dbmaestro-k8s" }
+            - name: GITHUB_TOKEN
+              valueFrom: { secretKeyRef: { name: github-token, key: token } }
+          volumeMounts:
+            - { name: start, mountPath: /opt/start }
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits:   { memory: 2Gi }
+      volumes:
+        - name: start
+          configMap: { name: github-runner-start }

@@ -1,0 +1,159 @@
+# Database release pipeline for the DBmaestro project "Github-Integration".
+#
+#   Pull request that touches packages/<name>/   -> detect -> DBmaestro package + precheck -> PR comment
+#   Merge into main                              -> Release_Source -> QA -> Prod (GitHub Environment approval)
+#
+# The DBmaestro steps come from the DBmaestro CI/CD library (github.com/DBMaestroDev/dbmaestro-cicd@v1):
+# change detection uses its composite action, packaging / precheck / upgrade run its core scripts through
+# .github/scripts/dbmaestro.sh, which also turns DBmaestro's verdicts into GitHub annotations and job summaries.
+#
+# Settings -> Secrets and variables -> Actions
+#   vars.DBMAESTRO_SERVER     agent.dop.svc.cluster.local:80   (runner runs in the same cluster as DOP)
+#   vars.DBMAESTRO_USE_SSL    False
+#   vars.DBMAESTRO_USER       github-ci@dbmaestro.com
+#   vars.DBMAESTRO_UI_URL     http://localhost:8081            (links in summaries and PR comments)
+#   vars.CLI_VERSION          26.4.0.14192                     (DBmaestroCLI release, match the DOP server)
+#   secrets.DBMAESTRO_PASSWORD
+
+name: Database Release
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['packages/**']
+  push:
+    branches: [main]
+    paths: ['packages/**']
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Packages to release (comma-separated, e.g. V3,V4). Empty = changed in the last commit.'
+        required: false
+        default: ''
+
+concurrency:
+  group: database-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  DBMAESTRO_PROJECT_NAME: Github-Integration
+  DBMAESTRO_PROJECT_ID: '9'
+  DBMAESTRO_SERVER: ${{ vars.DBMAESTRO_SERVER }}
+  DBMAESTRO_USE_SSL: ${{ vars.DBMAESTRO_USE_SSL }}
+  DBMAESTRO_USER: ${{ vars.DBMAESTRO_USER }}
+  DBMAESTRO_PASSWORD: ${{ secrets.DBMAESTRO_PASSWORD }}
+  DBMAESTRO_UI_URL: ${{ vars.DBMAESTRO_UI_URL }}
+  DBMAESTRO_AGENT_JAR: /home/runner/DBmaestroAgent.jar   # downloaded from DBMaestroDev/DBmaestroCLI by get-cli-jar
+  DBMAESTRO_PACKAGES_FOLDER: packages
+
+jobs:
+  # ------------------------------------------------------------------ which packages changed
+  detect:
+    name: Detect changed packages
+    runs-on: [self-hosted, dbmaestro-k8s]
+    outputs:
+      has_packages: ${{ steps.detect.outputs.has_packages }}
+      packages_list: ${{ steps.detect.outputs.packages_list }}
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+
+      - name: Detect changed packages
+        id: detect
+        uses: DBMaestroDev/dbmaestro-cicd/.github/actions/sh/detect-changed-packages@v1
+        with:
+          is_pull_request: ${{ github.event_name == 'pull_request' }}
+          base_ref: ${{ github.base_ref }}
+          detect_from_push: ${{ github.event_name == 'push' }}
+          package_name: ${{ github.event.inputs.packages }}
+
+      - name: Summary
+        run: |
+          echo "### 📦 Database packages in this change" >> "$GITHUB_STEP_SUMMARY"
+          echo "**${{ steps.detect.outputs.packages_list || 'none' }}**" >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ pull request
+  precheck:
+    name: DBmaestro package & precheck
+    if: github.event_name == 'pull_request' && needs.detect.outputs.has_packages == 'true'
+    needs: detect
+    runs-on: [self-hosted, dbmaestro-k8s]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with: { repository: DBMaestroDev/dbmaestro-cicd, ref: v1, path: dbmaestro-cicd }
+      - name: Get DBmaestro CLI ${{ vars.CLI_VERSION }}
+        uses: DBMaestroDev/dbmaestro-cicd/.github/actions/sh/get-cli-jar@v1
+        with: { version: '${{ vars.CLI_VERSION }}', jar-path: '${{ env.DBMAESTRO_AGENT_JAR }}' }
+
+      - name: Package and precheck in DBmaestro
+        id: precheck
+        env:
+          PACKAGES: ${{ needs.detect.outputs.packages_list }}
+        run: |
+          rc=0
+          for PKG in ${PACKAGES//,/ }; do
+            DBMAESTRO_PACKAGE_NAME="$PKG" .github/scripts/dbmaestro.sh create-package "$PKG" || { rc=1; break; }
+            DBMAESTRO_PACKAGE_NAME="$PKG" .github/scripts/dbmaestro.sh precheck-package "$PKG" || rc=1
+          done
+          exit $rc
+
+      - name: Comment on the pull request
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: .github/scripts/pr-comment.sh "$PR"
+
+  # ------------------------------------------------------------------ merge into main
+  release-source:
+    name: Release Source
+    if: github.event_name != 'pull_request' && needs.detect.outputs.has_packages == 'true'
+    needs: detect
+    runs-on: [self-hosted, dbmaestro-k8s]
+    environment:
+      name: Release_Source
+      url: ${{ vars.DBMAESTRO_UI_URL }}/project/9/pipeline
+    steps: &upgrade
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with: { repository: DBMaestroDev/dbmaestro-cicd, ref: v1, path: dbmaestro-cicd }
+      - name: Get DBmaestro CLI ${{ vars.CLI_VERSION }}
+        uses: DBMaestroDev/dbmaestro-cicd/.github/actions/sh/get-cli-jar@v1
+        with: { version: '${{ vars.CLI_VERSION }}', jar-path: '${{ env.DBMAESTRO_AGENT_JAR }}' }
+      - name: Upgrade ${{ env.TARGET_ENV }} with DBmaestro
+        env:
+          PACKAGES: ${{ needs.detect.outputs.packages_list }}
+        run: |
+          export DBMAESTRO_TARGET_ENV="$TARGET_ENV"
+          for PKG in ${PACKAGES//,/ }; do
+            DBMAESTRO_PACKAGE_NAME="$PKG" .github/scripts/dbmaestro.sh upgrade-environment "$PKG" || exit 1
+          done
+    env:
+      TARGET_ENV: Release_Source
+
+  qa:
+    name: QA
+    needs: [detect, release-source]
+    runs-on: [self-hosted, dbmaestro-k8s]
+    environment:
+      name: QA
+      url: ${{ vars.DBMAESTRO_UI_URL }}/project/9/pipeline
+    env:
+      TARGET_ENV: QA
+    steps: *upgrade
+
+  prod:
+    name: Production
+    needs: [detect, qa]
+    runs-on: [self-hosted, dbmaestro-k8s]
+    environment:
+      name: Prod                      # required reviewers on this environment = the approval gate
+      url: ${{ vars.DBMAESTRO_UI_URL }}/project/9/pipeline
+    env:
+      TARGET_ENV: Prod
+    steps: *upgrade
