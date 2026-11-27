@@ -36,7 +36,9 @@ clean() { sed -E 's/^(FINE|INFO|SEVERE|WARNING) [0-9\/]+ [0-9:]+ //; s/\r$//' "$
 mapfile -t BLOCKS   < <(clean | grep -oE "Block: .*"   | sort -u)
 mapfile -t WARNINGS < <(clean | grep -oE "Warning: '.*" | sort -u)
 mapfile -t SCRIPTS  < <(clean | grep -oE "In Script [^,]+" | sed 's/In Script //' | sort -u)
-DRIFT=$(clean | grep -E "Pre-Validation|[Dd]rift" | head -3)
+# Drift lines look like:  ... drift detected on the Release Source, 1 object(s) differ from label 'V3 (Rev. 1)-post': TABLE github_rs.customers. See the Pre Validate report.
+DRIFT=$(clean | grep -oE "drift detected.*" | sed -E 's/\.? *See the Pre Validate report\.?//' | head -1)
+[ -z "$DRIFT" ] && DRIFT=$(clean | grep -E "Pre-Validation|[Dd]rift" | head -1)
 ERRORS=$(clean | grep -iE "SEVERE|ERROR|failed" | grep -vE "Block:|Warning:" | head -5)
 SCRIPT_TXT=${SCRIPTS[*]:-}
 
@@ -50,7 +52,7 @@ elif [ ${#BLOCKS[@]} -gt 0 ]; then
   verdict="⛔ Blocked by DBmaestro Policy Engine"
 elif [ -n "$DRIFT" ]; then
   verdict="⛔ Drift detected: $ENV_LABEL no longer matches what DBmaestro last deployed"
-  echo "::error title=$title — drift detected::$ENV_LABEL was changed outside the release pipeline. DBmaestro stopped the deployment before touching it. $(echo "$DRIFT" | head -1)"
+  echo "::error title=$title — drift detected::$ENV_LABEL was changed outside the release pipeline. DBmaestro stopped the deployment before touching it: $DRIFT"
 else
   verdict="❌ Failed"
   echo "::error title=$title — failed::$(echo "${ERRORS:-see the job log}" | tail -1)"
@@ -60,7 +62,7 @@ details=""
 for b in "${BLOCKS[@]}";   do details+="⛔ \`$b\`<br>"; done
 for w in "${WARNINGS[@]}"; do details+="⚠️ \`$w\`<br>"; done
 [ -n "$SCRIPT_TXT" ] && [ -n "$details" ] && details+="in \`$SCRIPT_TXT\`<br>"
-[ -n "$DRIFT" ] && [ "$rc" -ne 0 ] && details+="🔍 \`$(echo "$DRIFT" | head -1 | tr '|' '/')\`<br>"
+[ -n "$DRIFT" ] && [ "$rc" -ne 0 ] && details+="🔍 \`$(echo "$DRIFT" | tr '|' '/')\`<br>"
 
 link="${DBMAESTRO_UI_URL:-}/project/${DBMAESTRO_PROJECT_ID:-}/pipeline"
 if [ ! -s "$GITHUB_STEP_SUMMARY" ] || ! grep -q "^| Package | Step" "$GITHUB_STEP_SUMMARY"; then
