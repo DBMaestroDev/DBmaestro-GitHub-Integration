@@ -75,3 +75,7 @@ which adds the annotations and summaries.
 
 A self-hosted runner runs as a pod in the same Kubernetes cluster as DBmaestro, so jobs reach the
 DBmaestro agent by its service name. See [`runner/runner.yaml`](runner/runner.yaml).
+
+## Demo
+
+The recording script, with the proven outputs of each act, is [`demo/DEMO-SCRIPT.md`](demo/DEMO-SCRIPT.md).
