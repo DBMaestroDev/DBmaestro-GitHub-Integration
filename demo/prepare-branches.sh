@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Pushes the three demo branches (no pull requests) so nothing is typed on camera.
 # Package numbers are arguments so the script can be re-run after a recording:
-#   demo/prepare-branches.sh 3 4 5
+#   demo/prepare-branches.sh 6 7 8
+# The objects are fixed (loyalty_tier, orders_customer_idx, customers_legacy): before a re-run, roll the
+# good and drift packages back (-Rollback -PackageName <n>: this project deploys by tasks, so a rollback
+# undoes that one package) so the objects don't already exist. See demo/DEMO-SCRIPT.md, "Reset".
 # On GitHub the PR checks run on the PR merge commit, so a branch made before the previous act was merged
 # still only shows its own package. No refresh between acts is needed (unlike the GitLab demo).
 set -euo pipefail
@@ -25,13 +28,13 @@ make_pkg() {  # make_pkg <version> <branch> <message> <upgrade-sql> <downgrade-s
   echo "pushed $branch (packages/V$v)"
 }
 
-make_pkg "$GOOD" "V$GOOD-customer-segment" "add segment to customers" \
-  "ALTER TABLE customers ADD COLUMN segment VARCHAR(20);" \
-  "ALTER TABLE customers DROP COLUMN segment;"
+make_pkg "$GOOD" "V$GOOD-customer-loyalty-tier" "add loyalty_tier to customers" \
+  "ALTER TABLE customers ADD COLUMN loyalty_tier VARCHAR(20);" \
+  "ALTER TABLE customers DROP COLUMN loyalty_tier;"
 
-make_pkg "$DRIFT" "V$DRIFT-customer-email-index" "index customers by email" \
-  "CREATE INDEX customers_email_idx ON customers (email);" \
-  "DROP INDEX customers_email_idx;"
+make_pkg "$DRIFT" "V$DRIFT-orders-customer-index" "index orders by customer" \
+  "CREATE INDEX orders_customer_idx ON orders (customer_id);" \
+  "DROP INDEX orders_customer_idx;"
 
 make_pkg "$DROP" "V$DROP-retire-customers-legacy" "retire the customers_legacy table" \
   "DROP TABLE customers_legacy;" \
